@@ -1,6 +1,9 @@
 #! /usr/bin/env python
 
 import time
+import os
+import copy
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 import numpy as np
 import tensorflow as tf
@@ -8,6 +11,7 @@ from keras.models import load_model
 
 import cv2
 import scipy.ndimage as ndimage
+import skimage.draw
 from skimage.draw import circle
 from skimage.feature import peak_local_max
 
@@ -17,16 +21,26 @@ from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Float32MultiArray
 
+import spartan.utils.utils as spartan_utils
+
+
+
+
 bridge = CvBridge()
 
 # Load the Network.
-MODEL_FILE = 'PATH/TO/model.hdf5'
+
+spartan_source_dir = spartan_utils.getSpartanSourceDir()
+model_rel_to_spartan_source = 'modules/spartan/ggcnn/data/networks/ggcnn_rss/epoch_29_model.hdf5'
+MODEL_FILE = os.path.join(spartan_source_dir, model_rel_to_spartan_source)
+# MODEL_FILE = 'PATH/TO/model.hdf5'
 model = load_model(MODEL_FILE)
 
 rospy.init_node('ggcnn_detection')
 
 # Output publishers.
 grasp_pub = rospy.Publisher('ggcnn/img/grasp', Image, queue_size=1)
+grasp_line_pub = rospy.Publisher('ggcnn/img/grasp_line', Image, queue_size=1)
 grasp_plain_pub = rospy.Publisher('ggcnn/img/grasp_plain', Image, queue_size=1)
 depth_pub = rospy.Publisher('ggcnn/img/depth', Image, queue_size=1)
 ang_pub = rospy.Publisher('ggcnn/img/ang', Image, queue_size=1)
@@ -35,17 +49,34 @@ cmd_pub = rospy.Publisher('ggcnn/out/command', Float32MultiArray, queue_size=1)
 # Initialise some globals.
 prev_mp = np.array([150, 150])
 ROBOT_Z = 0
+ROBOT_Z = 0.5 # manuelli: hack for now
+ALWAYS_MAX = True  # Use ALWAYS_MAX = True for the open-loop solution.
+NETWORK_IMG_SIZE = 300
+WIDTH_SCALE_FACTOR = 150
 
 # Tensorflow graph to allow use in callback.
 graph = tf.get_default_graph()
 
+cameraName = 'camera_carmine_1'
+pointCloudTopic = '/' + str(cameraName) + '/depth/points'
+rgbImageTopic   = '/' + str(cameraName) + '/rgb/image_rect_color'
+depthImageTopic = '/' + str(cameraName) + '/depth_registered/sw_registered/image_rect'
+camera_info_topic = '/' + str(cameraName) + '/rgb/camera_info'
+graspFrameName = 'base'
+depthOpticalFrameName = cameraName + "_depth_optical_frame"
+rgbOpticalFrameName = cameraName + "_rgb_optical_frame"
+
 # Get the camera parameters
-camera_info_msg = rospy.wait_for_message('/camera/depth/camera_info', CameraInfo)
+rospy.loginfo("Wating for CameraInfo msg . . .")
+camera_info_msg = rospy.wait_for_message(camera_info_topic, CameraInfo)
+rospy.loginfo("received for CameraInfo msg")
 K = camera_info_msg.K
 fx = K[0]
 cx = K[2]
 fy = K[4]
 cy = K[5]
+image_width = camera_info_msg.width
+image_height = camera_info_msg.height
 
 
 # Execution Timing
@@ -65,29 +96,40 @@ class TimeIt:
             print('%s: %s' % (self.s, self.t1 - self.t0))
 
 
+
+
 def robot_pos_callback(data):
     global ROBOT_Z
     ROBOT_Z = data.pose.position.z
 
 
 def depth_callback(depth_message):
+    rospy.loginfo("received a depth message")
     global model
     global graph
     global prev_mp
     global ROBOT_Z
     global fx, cx, fy, cy
 
+    print "type(depth_message):", type(depth_message)
+
     with TimeIt('Crop'):
         depth = bridge.imgmsg_to_cv2(depth_message)
+        print "type(depth):", type(depth)
+        print "depth.dtype:", depth.dtype
+        print "depth min", np.min(depth)
+        print "depth max", np.max(depth)
+        print "depth.shape", depth.shape
+        print "depth[200,200]", depth[200, 200]
 
         # Crop a square out of the middle of the depth and resize it to 300*300
         crop_size = 400
-        depth_crop = cv2.resize(depth[(480-crop_size)//2:(480-crop_size)//2+crop_size, (640-crop_size)//2:(640-crop_size)//2+crop_size], (300, 300))
+        depth_crop = cv2.resize(depth[(image_height-crop_size)//2:(image_height-crop_size)//2+crop_size, (image_width-crop_size)//2:(image_width-crop_size)//2+crop_size], (300, 300))
 
         # Replace nan with 0 for inpainting.
         depth_crop = depth_crop.copy()
         depth_nan = np.isnan(depth_crop).copy()
-        depth_crop[depth_nan] = 0
+        depth_crop[depth_nan] = 0 # set nan's to zero
 
     with TimeIt('Inpaint'):
         # open cv inpainting does weird things at the border.
@@ -136,7 +178,7 @@ def depth_callback(depth_message):
         # Calculate the best pose from the camera intrinsics.
         maxes = None
 
-        ALWAYS_MAX = False  # Use ALWAYS_MAX = True for the open-loop solution.
+        
 
         if ROBOT_Z > 0.34 or ALWAYS_MAX:  # > 0.34 initialises the max tracking when the robot is reset.
             # Track the global max.
@@ -152,12 +194,17 @@ def depth_callback(depth_message):
             # Keep a global copy for next iteration.
             prev_mp = (max_pixel * 0.25 + prev_mp * 0.75).astype(np.int)
 
+        # note: prev_mp is in the depth_crop image coordinates, so it's the
+        # [300, 300] format
+        max_pixel_crop_coords = copy.copy(prev_mp)
         ang = ang_out[max_pixel[0], max_pixel[1]]
         width = width_out[max_pixel[0], max_pixel[1]]
 
         # Convert max_pixel back to uncropped/resized image coordinates in order to do the camera transform.
-        max_pixel = ((np.array(max_pixel) / 300.0 * crop_size) + np.array([(480 - crop_size)//2, (640 - crop_size) // 2]))
+        max_pixel = ((np.array(max_pixel) / 300.0 * crop_size) + np.array([(image_height - crop_size)//2, (image_width - crop_size) // 2]))
         max_pixel = np.round(max_pixel).astype(np.int)
+
+        # now max_pixel is now the original image coordinates [480, 640]
 
         point_depth = depth[max_pixel[0], max_pixel[1]]
 
@@ -167,7 +214,7 @@ def depth_callback(depth_message):
         z = point_depth
 
         if np.isnan(z):
-            return
+            return False
 
     with TimeIt('Draw'):
         # Draw grasp markers on the points_out and publish it. (for visualisation)
@@ -175,17 +222,62 @@ def depth_callback(depth_message):
         grasp_img[:,:,2] = (points_out * 255.0)
 
         grasp_img_plain = grasp_img.copy()
+        grasp_line_img = grasp_img.copy()
 
         rr, cc = circle(prev_mp[0], prev_mp[1], 5)
+
         grasp_img[rr, cc, 0] = 0
         grasp_img[rr, cc, 1] = 255
         grasp_img[rr, cc, 2] = 0
+
+
+        # need start and end pixels of line
+        width_in_pixels = width*WIDTH_SCALE_FACTOR
+
+        print "ang", ang
+        print "ang (deg):", np.rad2deg(ang)
+        print "max_pixel_crop_coords", max_pixel_crop_coords
+        angle_direction_in_img = np.array([-np.sin(ang), np.cos(ang)])
+
+        # note left/right have no real meaning here
+        grasp_left_finger = max_pixel_crop_coords + width/2.0*angle_direction_in_img
+        grasp_right_finger = max_pixel_crop_coords - width/2.0*angle_direction_in_img
+
+        grasp_left_finger = np.round(grasp_left_finger).astype(np.int)
+        grasp_right_finger = np.round(grasp_right_finger).astype(np.int)
+
+        print "grasp_right_finger", grasp_right_finger
+
+        # clip to pixel coords
+        grasp_left_finger = np.clip(grasp_left_finger, 0, NETWORK_IMG_SIZE - 1)
+        grasp_right_finger = np.clip(grasp_right_finger, 0, NETWORK_IMG_SIZE - 1)
+
+        print "grasp_right_finger", grasp_right_finger
+
+
+        # open CV has (u,v) format rather than (row, col)
+
+        cv2.line(grasp_line_img, tuple(grasp_left_finger[::-1]), tuple(grasp_right_finger[::-1]), (255,0,0), thickness=5)
+
+        cv2.circle(grasp_line_img, tuple(max_pixel_crop_coords[::-1]), 5, (0, 255, 0), -1)
+
+        # rr_line, cc_line = skimage.draw.line(grasp_left_finger[0], grasp_left_finger[1], grasp_right_finger[0], grasp_right_finger[1])
+        #
+        # grasp_line_img[rr_line, cc_line, :] = np.array([255, 0, 0]) # should be blue
+        # grasp_line_img[rr, cc, :] = np.array([0,255,0]) # green: grasp center
+
+
+
 
     with TimeIt('Publish'):
         # Publish the output images (not used for control, only visualisation)
         grasp_img = bridge.cv2_to_imgmsg(grasp_img, 'bgr8')
         grasp_img.header = depth_message.header
         grasp_pub.publish(grasp_img)
+
+        grasp_line_img_msg = bridge.cv2_to_imgmsg(grasp_line_img, 'bgr8')
+        grasp_line_img_msg.header = depth_message.header
+        grasp_line_pub.publish(grasp_line_img_msg)
 
         grasp_img_plain = bridge.cv2_to_imgmsg(grasp_img_plain, 'bgr8')
         grasp_img_plain.header = depth_message.header
@@ -201,8 +293,54 @@ def depth_callback(depth_message):
         cmd_pub.publish(cmd_msg)
 
 
-depth_sub = rospy.Subscriber('/camera/depth/image_meters', Image, depth_callback, queue_size=1)
-robot_pos_sub = rospy.Subscriber('/m1n6s200_driver/out/tool_pose', PoseStamped, robot_pos_callback, queue_size=1)
+    rospy.loginfo("finished cleanly")
+
+# def visualize_grasp(grasp_quality_img, depth_crop, ang_img, width_img,
+#                     depth_img, max_pixel, max_pixel_crop):
+#     # Draw grasp markers on the points_out and publish it. (for visualisation)
+#     grasp_img = np.zeros((NETWORK_IMG_SIZE, NETWORK_IMG_SIZE, 3), dtype=np.uint8)
+#     grasp_img[:, :, 2] = (grasp_quality_img * 255.0)
+#
+#     grasp_img_plain = grasp_img.copy()
+#
+#     rr, cc = circle(prev_mp[0], prev_mp[1], 5)
+#     grasp_img[rr, cc, 0] = 0
+#     grasp_img[rr, cc, 1] = 255
+#     grasp_img[rr, cc, 2] = 0
+#
+#
+#     with TimeIt('Publish'):
+#         # Publish the output images (not used for control, only visualisation)
+#         grasp_img = bridge.cv2_to_imgmsg(grasp_img, 'bgr8')
+#         grasp_img.header = depth_message.header
+#         grasp_pub.publish(grasp_img)
+#
+#         grasp_img_plain = bridge.cv2_to_imgmsg(grasp_img_plain, 'bgr8')
+#         grasp_img_plain.header = depth_message.header
+#         grasp_plain_pub.publish(grasp_img_plain)
+#
+#         depth_pub.publish(bridge.cv2_to_imgmsg(depth_crop))
+#
+#         ang_pub.publish(bridge.cv2_to_imgmsg(ang_out))
+#
+#         # Output the best grasp pose relative to camera.
+#         cmd_msg = Float32MultiArray()
+#         cmd_msg.data = [x, y, z, ang, width, depth_center]
+#         cmd_pub.publish(cmd_msg)
+#
+#
+#     """
+#     Visualizes the grasp
+#     :return:
+#     :rtype:
+#     """
+
+
+# depth_sub = rospy.Subscriber('/camera/depth/image_meters', Image, depth_callback, queue_size=1)
+
+# the depth image should be in meters
+depth_sub = rospy.Subscriber(depthImageTopic, Image, depth_callback, queue_size=1)
+# robot_pos_sub = rospy.Subscriber('/m1n6s200_driver/out/tool_pose', PoseStamped, robot_pos_callback, queue_size=1)
 
 while not rospy.is_shutdown():
     rospy.spin()
