@@ -246,13 +246,13 @@ def depth_callback(depth_message):
         grasp_left_finger = np.round(grasp_left_finger).astype(np.int)
         grasp_right_finger = np.round(grasp_right_finger).astype(np.int)
 
-        print "grasp_right_finger", grasp_right_finger
+        
 
         # clip to pixel coords
         grasp_left_finger = np.clip(grasp_left_finger, 0, NETWORK_IMG_SIZE - 1)
         grasp_right_finger = np.clip(grasp_right_finger, 0, NETWORK_IMG_SIZE - 1)
 
-        print "grasp_right_finger", grasp_right_finger
+        
 
 
         # open CV has (u,v) format rather than (row, col)
@@ -293,7 +293,7 @@ def depth_callback(depth_message):
         cmd_pub.publish(cmd_msg)
 
 
-    rospy.loginfo("finished cleanly")
+    
 
 # def visualize_grasp(grasp_quality_img, depth_crop, ang_img, width_img,
 #                     depth_img, max_pixel, max_pixel_crop):
