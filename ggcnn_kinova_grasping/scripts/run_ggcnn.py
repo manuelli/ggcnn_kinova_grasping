@@ -16,13 +16,15 @@ from skimage.draw import circle
 from skimage.feature import peak_local_max
 
 import rospy
+import tf2_ros
+import geometry_msgs.msg
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Float32MultiArray
 
 import spartan.utils.utils as spartan_utils
-
+from director.thirdparty import transformations
 
 
 
@@ -45,6 +47,8 @@ grasp_plain_pub = rospy.Publisher('ggcnn/img/grasp_plain', Image, queue_size=1)
 depth_pub = rospy.Publisher('ggcnn/img/depth', Image, queue_size=1)
 ang_pub = rospy.Publisher('ggcnn/img/ang', Image, queue_size=1)
 cmd_pub = rospy.Publisher('ggcnn/out/command', Float32MultiArray, queue_size=1)
+
+tf2_broadcaster = tf2_ros.TransformBroadcaster()
 
 # Initialise some globals.
 prev_mp = np.array([150, 150])
@@ -216,6 +220,9 @@ def depth_callback(depth_message):
         if np.isnan(z):
             return False
 
+
+        print "x,y,z: ", [x,y,z]
+
     with TimeIt('Draw'):
         # Draw grasp markers on the points_out and publish it. (for visualisation)
         grasp_img = np.zeros((300, 300, 3), dtype=np.uint8)
@@ -234,9 +241,9 @@ def depth_callback(depth_message):
         # need start and end pixels of line
         width_in_pixels = width*WIDTH_SCALE_FACTOR
 
-        print "ang", ang
+        # print "ang", ang
         print "ang (deg):", np.rad2deg(ang)
-        print "max_pixel_crop_coords", max_pixel_crop_coords
+        # print "max_pixel_crop_coords", max_pixel_crop_coords
         angle_direction_in_img = np.array([-np.sin(ang), np.cos(ang)])
 
         # note left/right have no real meaning here
@@ -291,6 +298,26 @@ def depth_callback(depth_message):
         cmd_msg = Float32MultiArray()
         cmd_msg.data = [x, y, z, ang, width, depth_center]
         cmd_pub.publish(cmd_msg)
+
+        # grasp to camera frame transform
+        grasp_to_camera = geometry_msgs.msg.TransformStamped()
+        grasp_to_camera.header = depth_message.header
+        grasp_to_camera.header.frame_id = rgbOpticalFrameName
+        grasp_to_camera.child_frame_id = "ggcnn_grasp"
+
+        grasp_to_camera.transform.translation.x = x
+        grasp_to_camera.transform.translation.y = y
+        grasp_to_camera.transform.translation.z = z
+
+        quat_wxyz = transformations.quaternion_about_axis(ang, [0,0,1])
+        grasp_to_camera.transform.rotation.w = quat_wxyz[0]
+        grasp_to_camera.transform.rotation.x = quat_wxyz[1]
+        grasp_to_camera.transform.rotation.y = quat_wxyz[2]
+        grasp_to_camera.transform.rotation.z = quat_wxyz[3]
+
+
+        tf2_broadcaster.sendTransform(grasp_to_camera)
+
 
 
     
