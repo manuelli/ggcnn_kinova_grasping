@@ -24,16 +24,19 @@ from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Float32MultiArray
 
 import spartan.utils.utils as spartan_utils
+import spartan_grasp_msgs.msg
 from director.thirdparty import transformations
 
 
 
 bridge = CvBridge()
 
+DEBUG = True
+
 # Load the Network.
 
 spartan_source_dir = spartan_utils.getSpartanSourceDir()
-model_rel_to_spartan_source = 'modules/spartan/ggcnn/data/networks/ggcnn_rss/epoch_29_model.hdf5'
+model_rel_to_spartan_source = 'data/networks/ggcnn_rss/epoch_29_model.hdf5'
 MODEL_FILE = os.path.join(spartan_source_dir, model_rel_to_spartan_source)
 # MODEL_FILE = 'PATH/TO/model.hdf5'
 model = load_model(MODEL_FILE)
@@ -47,6 +50,7 @@ grasp_plain_pub = rospy.Publisher('ggcnn/img/grasp_plain', Image, queue_size=1)
 depth_pub = rospy.Publisher('ggcnn/img/depth', Image, queue_size=1)
 ang_pub = rospy.Publisher('ggcnn/img/ang', Image, queue_size=1)
 cmd_pub = rospy.Publisher('ggcnn/out/command', Float32MultiArray, queue_size=1)
+output_pub = rospy.Publisher('ggcnn/output', spartan_grasp_msgs.msg.GGCNN_output, queue_size=1)
 
 tf2_broadcaster = tf2_ros.TransformBroadcaster()
 
@@ -56,6 +60,7 @@ ROBOT_Z = 0
 ROBOT_Z = 0.5 # manuelli: hack for now
 ALWAYS_MAX = True  # Use ALWAYS_MAX = True for the open-loop solution.
 NETWORK_IMG_SIZE = 300
+CROP_SIZE = 400
 WIDTH_SCALE_FACTOR = 150
 
 # Tensorflow graph to allow use in callback.
@@ -71,9 +76,9 @@ depthOpticalFrameName = cameraName + "_depth_optical_frame"
 rgbOpticalFrameName = cameraName + "_rgb_optical_frame"
 
 # Get the camera parameters
-rospy.loginfo("Wating for CameraInfo msg . . .")
+rospy.loginfo("Waiting for CameraInfo msg . . .")
 camera_info_msg = rospy.wait_for_message(camera_info_topic, CameraInfo)
-rospy.loginfo("received for CameraInfo msg")
+rospy.loginfo("Received for CameraInfo msg")
 K = camera_info_msg.K
 fx = K[0]
 cx = K[2]
@@ -108,23 +113,30 @@ def robot_pos_callback(data):
 
 
 def depth_callback(depth_message):
+    
     rospy.loginfo("received a depth message")
+
+    if DEBUG:
+        rospy.loginfo("\nreceived a depth message")
     global model
     global graph
     global prev_mp
     global ROBOT_Z
     global fx, cx, fy, cy
 
-    print "type(depth_message):", type(depth_message)
+    if DEBUG:
+        print "type(depth_message):", type(depth_message)
 
     with TimeIt('Crop'):
         depth = bridge.imgmsg_to_cv2(depth_message)
-        print "type(depth):", type(depth)
-        print "depth.dtype:", depth.dtype
-        print "depth min", np.min(depth)
-        print "depth max", np.max(depth)
-        print "depth.shape", depth.shape
-        print "depth[200,200]", depth[200, 200]
+
+        if DEBUG:
+            print "type(depth):", type(depth)
+            print "depth.dtype:", depth.dtype
+            print "depth min", np.min(depth)
+            print "depth max", np.max(depth)
+            print "depth.shape", depth.shape
+            print "depth[200,200]", depth[200, 200]
 
         # Crop a square out of the middle of the depth and resize it to 300*300
         crop_size = 400
@@ -158,12 +170,18 @@ def depth_callback(depth_message):
 
     with TimeIt('Inference'):
         # Run it through the network.
+
+        # All the outputs are size 300 x 300
         depth_crop = np.clip((depth_crop - depth_crop.mean()), -1, 1)
         with graph.as_default():
             pred_out = model.predict(depth_crop.reshape((1, 300, 300, 1)))
 
         points_out = pred_out[0].squeeze()
         points_out[depth_nan] = 0
+
+        if DEBUG:
+            print "min(points_out)", np.min(points_out)
+            print "max(points_out)", np.max(points_out)
 
     with TimeIt('Trig'):
         # Calculate the angle map.
@@ -202,14 +220,21 @@ def depth_callback(depth_message):
         # [300, 300] format
         max_pixel_crop_coords = copy.copy(prev_mp)
         ang = ang_out[max_pixel[0], max_pixel[1]]
-        width = width_out[max_pixel[0], max_pixel[1]]
+
+        # this is already in pixels, but in the cropped image
+        width = width_out[max_pixel_crop_coords[0], max_pixel_crop_coords[1]] 
+        width_crop_scale = width_out[max_pixel_crop_coords[0], max_pixel_crop_coords[1]]
+        width_original_scale = width_crop_scale * CROP_SIZE*1.0/NETWORK_IMG_SIZE
+
+
+        if DEBUG:
+            print "width:", width
 
         # Convert max_pixel back to uncropped/resized image coordinates in order to do the camera transform.
-        max_pixel = ((np.array(max_pixel) / 300.0 * crop_size) + np.array([(image_height - crop_size)//2, (image_width - crop_size) // 2]))
+        max_pixel = ((np.array(max_pixel) / (1.0 * NETWORK_IMG_SIZE) * crop_size) + np.array([(image_height - crop_size)//2, (image_width - crop_size) // 2]))
         max_pixel = np.round(max_pixel).astype(np.int)
 
         # now max_pixel is now the original image coordinates [480, 640]
-
         point_depth = depth[max_pixel[0], max_pixel[1]]
 
         # These magic numbers are my camera intrinsic parameters.
@@ -221,7 +246,8 @@ def depth_callback(depth_message):
             return False
 
 
-        print "x,y,z: ", [x,y,z]
+        if DEBUG:
+            print "x,y,z: ", [x,y,z]
 
     with TimeIt('Draw'):
         # Draw grasp markers on the points_out and publish it. (for visualisation)
@@ -238,11 +264,9 @@ def depth_callback(depth_message):
         grasp_img[rr, cc, 2] = 0
 
 
-        # need start and end pixels of line
-        width_in_pixels = width*WIDTH_SCALE_FACTOR
-
         # print "ang", ang
-        print "ang (deg):", np.rad2deg(ang)
+        if DEBUG:
+            print "ang (deg):", np.rad2deg(ang)
         # print "max_pixel_crop_coords", max_pixel_crop_coords
         angle_direction_in_img = np.array([-np.sin(ang), np.cos(ang)])
 
@@ -259,11 +283,8 @@ def depth_callback(depth_message):
         grasp_left_finger = np.clip(grasp_left_finger, 0, NETWORK_IMG_SIZE - 1)
         grasp_right_finger = np.clip(grasp_right_finger, 0, NETWORK_IMG_SIZE - 1)
 
-        
-
 
         # open CV has (u,v) format rather than (row, col)
-
         cv2.line(grasp_line_img, tuple(grasp_left_finger[::-1]), tuple(grasp_right_finger[::-1]), (255,0,0), thickness=5)
 
         cv2.circle(grasp_line_img, tuple(max_pixel_crop_coords[::-1]), 5, (0, 255, 0), -1)
@@ -318,6 +339,24 @@ def depth_callback(depth_message):
 
         tf2_broadcaster.sendTransform(grasp_to_camera)
 
+        output_msg = spartan_grasp_msgs.msg.GGCNN_output()
+        output_msg.header = depth_message.header
+        output_msg.depth_image = depth_message
+        output_msg.camera_info = camera_info_msg
+
+        output_msg.crop_size = CROP_SIZE
+        output_msg.network_image_size = NETWORK_IMG_SIZE
+        output_msg.x = x
+        output_msg.y = y
+        output_msg.z = z
+        output_msg.width_pixels = width_original_scale
+        output_msg.angle = ang
+
+        output_pub.publish(output_msg)
+
+
+    # rate = 3
+    # rospy.sleep(1.0/rate)
 
 
     
